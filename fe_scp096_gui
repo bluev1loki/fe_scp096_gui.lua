@@ -1,0 +1,303 @@
+-- fe_scp096_gui.lua (LocalScript - StarterPlayerScripts)
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+
+local player = Players.LocalPlayer
+
+-- ======= CONFIG (ersetze IDs nach Wunsch) =======
+local SCREAM_SOUND_ID = "rbxassetid://183860253"
+local ATTACK_ANIM_IDS = {"rbxassetid://507766666","rbxassetid://507766667","rbxassetid://507766668"}
+local DASH_ANIM_ID = "rbxassetid://507766700"
+local ATTACK_SOUND_ID = "rbxassetid://12221967"
+local ATTACK_PARTICLE_TEXTURE = "rbxassetid://243660709"
+local TRANSFORM_WALKSPEED = 50
+local TRANSFORM_JUMPPOWER = 80
+local TRANSFORM_HIPHEIGHT = 2
+local COMBO_COOLDOWNS = {0.6, 1.0, 2.0}
+local DASH_COOLDOWN = 3
+local DASH_DISTANCE = 20
+local REMOTE_ATTACK = "SCP_AttackEvent"
+local REMOTE_DASH = "SCP_DashEvent"
+-- =======
+
+-- Remote references (if server created)
+local remoteAttack = ReplicatedStorage:FindFirstChild(REMOTE_ATTACK)
+local remoteDash = ReplicatedStorage:FindFirstChild(REMOTE_DASH)
+
+-- state
+local original = {}
+local comboState = 0
+local lastComboTime = 0
+local lastDash = 0
+local transformed = false
+
+-- helpers
+local function waitForChildOfClass(parent, className, timeout)
+	local t0 = tick()
+	local obj = parent:FindFirstChildOfClass(className)
+	while not obj and tick() - t0 < (timeout or 5) do
+		parent.ChildAdded:Wait()
+		obj = parent:FindFirstChildOfClass(className)
+	end
+	return obj
+end
+
+local function cameraShake(intensity, duration)
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local t0 = tick()
+	local orig = cam.CFrame
+	local conn
+	conn = RunService.RenderStepped:Connect(function()
+		local dt = tick() - t0
+		if dt > duration then
+			conn:Disconnect()
+			cam.CFrame = orig
+			return
+		end
+		local pct = 1 - dt/duration
+		local x = (math.random()-0.5)*2*intensity*pct
+		local y = (math.random()-0.5)*2*intensity*pct
+		local z = (math.random()-0.5)*2*intensity*pct
+		cam.CFrame = orig * CFrame.new(x,y,z)
+	end)
+end
+
+local function enablePostProcessing()
+	if not Lighting:FindFirstChild("SCP096_Blur") then
+		local blur = Instance.new("BlurEffect", Lighting)
+		blur.Name = "SCP096_Blur"; blur.Size = 0
+		TweenService:Create(blur, TweenInfo.new(0.6), {Size = 18}):Play()
+	end
+	if not Lighting:FindFirstChild("SCP096_Color") then
+		local cc = Instance.new("ColorCorrectionEffect", Lighting)
+		cc.Name = "SCP096_Color"; cc.Saturation = 0
+		TweenService:Create(cc, TweenInfo.new(0.6), {Saturation = -0.3, Contrast = 0.05}):Play()
+	end
+end
+
+local function disablePostProcessing()
+	local blur = Lighting:FindFirstChild("SCP096_Blur")
+	local cc = Lighting:FindFirstChild("SCP096_Color")
+	if blur then TweenService:Create(blur, TweenInfo.new(0.4), {Size = 0}):Play(); Debris:AddItem(blur,0.6) end
+	if cc then TweenService:Create(cc, TweenInfo.new(0.4), {Saturation = 0, Contrast = 0}):Play(); Debris:AddItem(cc,0.6) end
+end
+
+local function saveOriginals(character)
+	if not character then return end
+	local h = character:FindFirstChildOfClass("Humanoid")
+	if not h then return end
+	original.walk = h.WalkSpeed
+	original.jump = h.JumpPower
+	original.hip = h.HipHeight
+	original.parts = {}
+	for _,p in pairs(character:GetDescendants()) do
+		if p:IsA("BasePart") then
+			original.parts[p:GetFullName()] = {Color = p.Color, Transparency = p.Transparency, Material = p.Material}
+		end
+	end
+end
+
+local function restoreOriginals(character)
+	if not character then return end
+	local h = character:FindFirstChildOfClass("Humanoid")
+	if h and original.walk then
+		h.WalkSpeed = original.walk; h.JumpPower = original.jump; if original.hip then h.HipHeight = original.hip end
+	end
+	for _,p in pairs(character:GetDescendants()) do
+		if p:IsA("BasePart") then
+			local dat = original.parts and original.parts[p:GetFullName()]
+			if dat then p.Color = dat.Color; p.Transparency = dat.Transparency; p.Material = dat.Material end
+		end
+	end
+	disablePostProcessing()
+	transformed = false
+end
+
+local function applyTransform(character)
+	if not character then return end
+	local h = character:FindFirstChildOfClass("Humanoid")
+	if not h then return end
+	if not original.walk then saveOriginals(character) end
+	h.WalkSpeed = TRANSFORM_WALKSPEED
+	h.JumpPower = TRANSFORM_JUMPPOWER
+	if h.HipHeight then h.HipHeight = TRANSFORM_HIPHEIGHT end
+	for _,p in pairs(character:GetDescendants()) do
+		if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+			if not original.parts[p:GetFullName()] then
+				original.parts[p:GetFullName()] = {Color = p.Color, Transparency = p.Transparency, Material = p.Material}
+			end
+			p.Color = Color3.fromRGB(230,230,245)
+			if p ~= character:FindFirstChild("Head") then p.Transparency = math.clamp(p.Transparency + 0.08, 0, 0.6) end
+		end
+	end
+	enablePostProcessing()
+	local head = character:FindFirstChild("Head")
+	if head and SCREAM_SOUND_ID ~= "" then
+		local s = Instance.new("Sound", head); s.SoundId = SCREAM_SOUND_ID; s.Looped = true; s.Volume = 1; s:Play(); Debris:AddItem(s, 12)
+	end
+	transformed = true
+end
+
+-- particle burst helper
+local function spawnParticleBurst(pos, texture, amount, speedMin, speedMax)
+	local attach = Instance.new("Attachment")
+	attach.WorldPosition = pos
+	local pe = Instance.new("ParticleEmitter", attach)
+	pe.Texture = texture
+	pe.Lifetime = NumberRange.new(0.2,0.7)
+	pe.Speed = NumberRange.new(speedMin or 6, speedMax or 12)
+	pe.Rate = 0
+	pe.RotSpeed = NumberRange.new(-180,180)
+	pe.Size = NumberSequence.new({NumberSequenceKeypoint.new(0,0.6), NumberSequenceKeypoint.new(1,0)})
+	pe:Emit(amount or 30)
+	Debris:AddItem(attach,1)
+end
+
+local function screenFlash()
+	local gui = Instance.new("ScreenGui", player:WaitForChild("PlayerGui"))
+	gui.Name = "SCP_Flash"
+	local frame = Instance.new("Frame", gui)
+	frame.Size = UDim2.new(1,0,1,0); frame.BackgroundColor3 = Color3.new(1,1,1); frame.BackgroundTransparency = 1
+	for i=1,6 do frame.BackgroundTransparency = 1 - i*0.15; wait(0.02) end
+	for i=1,6 do frame.BackgroundTransparency = i*0.15; wait(0.02) end
+	gui:Destroy()
+end
+
+local function playAnim(character, animId)
+	if not character or not animId or animId == "" then return end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return end
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if not animator then animator = Instance.new("Animator", humanoid) end
+	local anim = Instance.new("Animation")
+	anim.AnimationId = tostring(animId)
+	local track = animator:LoadAnimation(anim)
+	track:Play()
+	track.Stopped:Connect(function() pcall(function() anim:Destroy() end) end)
+	return track
+end
+
+-- combo attack (local + server fire)
+local function doComboAttack()
+	local now = tick()
+	if comboState == 0 or now - lastComboTime > 1.2 then
+		comboState = 1
+	else
+		comboState = math.clamp(comboState + 1, 1, 3)
+	end
+	lastComboTime = now
+	local cd = COMBO_COOLDOWNS[comboState] or 1
+	local char = player.Character
+	if not char then return end
+	-- FX
+	playAnim(char, ATTACK_ANIM_IDS[comboState] or ATTACK_ANIM_IDS[1])
+	local root = char:FindFirstChild("HumanoidRootPart")
+	local pos = root and root.Position or (char.PrimaryPart and char.PrimaryPart.Position) or Vector3.new()
+	spawnParticleBurst(pos, ATTACK_PARTICLE_TEXTURE, 30 + comboState * 10, 6 + comboState*2, 14 + comboState*3)
+	cameraShake(0.4 * comboState, 0.35 + 0.1 * comboState)
+	screenFlash()
+	if player.Character and player.Character:FindFirstChild("Head") and ATTACK_SOUND_ID and ATTACK_SOUND_ID ~= "" then
+		local s = Instance.new("Sound", player.Character.Head); s.SoundId = ATTACK_SOUND_ID; s.Volume = 1 + 0.15*comboState; s:Play(); Debris:AddItem(s, 4)
+	end
+	-- Fire server: origin pos + look vector + combo level
+	if remoteAttack and remoteAttack:IsA("RemoteEvent") then
+		if root then remoteAttack:FireServer(root.Position, root.CFrame.LookVector, comboState) end
+	end
+	return cd
+end
+
+-- dash (client visual + server fire)
+local function doDash()
+	local now = tick()
+	if now - lastDash < DASH_COOLDOWN then return false end
+	lastDash = now
+	local char = player.Character
+	if not char then return false end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then return false end
+	playAnim(char, DASH_ANIM_ID)
+	cameraShake(0.6, 0.35)
+	local dir = root.CFrame.LookVector
+	local targetPos = root.Position + dir * DASH_DISTANCE
+	-- fast tween of root CFrame (client visual)
+	pcall(function()
+		root.CFrame = CFrame.new(targetPos)
+	end)
+	-- server notify
+	if remoteDash and remoteDash:IsA("RemoteEvent") then
+		remoteDash:FireServer(root.Position, dir)
+	end
+	return true
+end
+
+-- GUI build
+local function buildGUI()
+	local playerGui = player:WaitForChild("PlayerGui")
+	local existing = playerGui:FindFirstChild("SCP096_GUI_ADV")
+	if existing then existing:Destroy() end
+	local screenGui = Instance.new("ScreenGui", playerGui); screenGui.Name = "SCP096_GUI_ADV"; screenGui.ResetOnSpawn = false
+
+	local frame = Instance.new("Frame", screenGui)
+	frame.Size = UDim2.new(0,320,0,200); frame.Position = UDim2.new(0,20,0,60); frame.BackgroundTransparency = 0.2; frame.BackgroundColor3 = Color3.fromRGB(18,18,18); frame.BorderSizePixel = 0; frame.Active = true; frame.Draggable = true
+
+	local title = Instance.new("TextLabel", frame); title.Size = UDim2.new(1,-10,0,30); title.Position = UDim2.new(0,5,0,5); title.BackgroundTransparency = 1; title.Text = "SCP-096 — Überarbeitet"; title.TextColor3 = Color3.fromRGB(240,240,240); title.Font = Enum.Font.SourceSansBold; title.TextXAlignment = Enum.TextXAlignment.Left
+
+	local btnTransform = Instance.new("TextButton", frame); btnTransform.Size = UDim2.new(0,300,0,40); btnTransform.Position = UDim2.new(0,10,0,42); btnTransform.Text = "Verwandeln / Toggle"; btnTransform.Font = Enum.Font.SourceSans; btnTransform.TextSize = 18
+
+	local btnAttack = Instance.new("TextButton", frame); btnAttack.Size = UDim2.new(0,140,0,34); btnAttack.Position = UDim2.new(0,10,0,92); btnAttack.Text = "Attack"; btnAttack.Font = Enum.Font.SourceSansBold; btnAttack.TextSize = 16
+
+	local cmbLabel = Instance.new("TextLabel", frame); cmbLabel.Size = UDim2.new(0,160,0,34); cmbLabel.Position = UDim2.new(0,156,0,92); cmbLabel.BackgroundTransparency = 1; cmbLabel.Text = "Combo: 0"; cmbLabel.TextColor3 = Color3.fromRGB(220,220,220); cmbLabel.Font = Enum.Font.SourceSansItalic
+
+	local btnDash = Instance.new("TextButton", frame); btnDash.Size = UDim2.new(0,140,0,32); btnDash.Position = UDim2.new(0,10,0,132); btnDash.Text = "Dash"; btnDash.Font = Enum.Font.SourceSans; btnDash.TextSize = 14
+
+	local btnReset = Instance.new("TextButton", frame); btnReset.Size = UDim2.new(0,140,0,32); btnReset.Position = UDim2.new(0,170,0,132); btnReset.Text = "Reset"; btnReset.Font = Enum.Font.SourceSans; btnReset.TextSize = 14
+
+	local cooldownBar = Instance.new("Frame", frame); cooldownBar.Size = UDim2.new(0,300,0,8); cooldownBar.Position = UDim2.new(0,10,0,172); cooldownBar.BackgroundColor3 = Color3.fromRGB(40,40,40)
+	local cooldownFill = Instance.new("Frame", cooldownBar); cooldownFill.Size = UDim2.new(0,0,1,0); cooldownFill.BackgroundColor3 = Color3.fromRGB(120,30,30)
+
+	btnTransform.MouseButton1Click:Connect(function()
+		if transformed then
+			restoreOriginals(player.Character)
+		else
+			applyTransform(player.Character or player.CharacterAdded:Wait())
+		end
+	end)
+
+	btnAttack.MouseButton1Click:Connect(function()
+		local cd = doComboAttack()
+		cmbLabel.Text = "Combo: "..tostring(comboState)
+		-- cooldown UI
+		if cd then
+			cooldownFill:TweenSize(UDim2.new(1,0,1,0), "Out", "Quad", 0.08, true)
+			delay(cd, function() cooldownFill.Size = UDim2.new(0,0,1,0) end)
+		end
+		delay(1.2, function() comboState = 0; cmbLabel.Text = "Combo: 0" end)
+	end)
+
+	btnDash.MouseButton1Click:Connect(function()
+		local ok = doDash()
+		if ok then
+			cooldownFill:TweenSize(UDim2.new(1,0,1,0), "Out", "Quad", 0.08, true)
+			delay(DASH_COOLDOWN, function() cooldownFill.Size = UDim2.new(0,0,1,0) end)
+		end
+	end)
+
+	btnReset.MouseButton1Click:Connect(function()
+		restoreOriginals(player.Character)
+	end)
+end
+
+-- init
+buildGUI()
+player.CharacterAdded:Connect(function(char)
+	waitForChildOfClass(char, "Humanoid", 5)
+	if transformed then applyTransform(char) end
+end)
+if player.Character then waitForChildOfClass(player.Character, "Humanoid", 5) end
+print("SCP-096 client GUI loaded")
